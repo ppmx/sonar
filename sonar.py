@@ -21,7 +21,6 @@ class SonarMsgType(enum.IntEnum):
 
     BROADCAST = enum.auto()
     BROADCAST_REPLY = enum.auto()
-    CHANNEL_OPENER = enum.auto()
 
 class SonarParserException(Exception):
     """ Used to propagate any error that occurs during parsing an
@@ -186,7 +185,7 @@ class SonarPeer:
             self.payload = payload
 
     def __str__(self):
-        return f"[SonarPeer] {self.hostname} @ {self.ipaddr} - {self.payload}"
+        return f"{self.hostname}@{self.ipaddr} ({self.payload})"
 
 class PeersStorage(threading.Thread):
     def __init__(self, deadline=datetime.timedelta(seconds=120)):
@@ -268,17 +267,19 @@ def main():
 
     rp.start()
 
+
     try:
         while True:
-            for peer in rp.get_active_peers():
-                print(peer)
+            active_peers = rp.get_active_peers()
+
+            print(datetime.datetime.now().ctime(), f"- {len(active_peers)} peers active")
+            for peer in active_peers:
+                print(" " * 24, peer)
 
             time.sleep(10)
     except KeyboardInterrupt:
         print("[*] shutting down")
         rp.shutdown()
-
-    rp.join()
 
 if __name__ == "__main__":
     main()
