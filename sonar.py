@@ -14,6 +14,11 @@ import threading
 import time
 import typing
 
+try:
+    from aiohttp import web
+except ModuleNotFoundError:
+    web = None
+
 from Crypto.Cipher import Salsa20
 
 class SonarMsgType(enum.IntEnum):
@@ -27,7 +32,33 @@ class SonarParserException(Exception):
     incoming (maybe even non-sonar) message.
     """
 
-class SonarMessaging:
+class SonarPeer:
+    def __init__(self, ipaddr: str, payload: str, hostname: str, peer_id: str):
+        self.ipaddr = ipaddr
+        self.hostname = hostname
+        self.peer_id = peer_id
+        self.payload = payload
+
+        self.last_update = None
+        self.update()
+
+    def dump_dict(self):
+        return {
+            "ipaddr": self.ipaddr,
+            "hostname": self.hostname,
+            "payload": self.payload
+        }
+
+    def update(self, payload=None):
+        self.last_update = datetime.datetime.now()
+
+        if payload:
+            self.payload = payload
+
+    def __str__(self):
+        return f"{self.hostname}@{self.ipaddr} ({self.payload})"
+
+class SonarProto:
     """ Protocol implementation """
 
     def __init__(self):
@@ -46,21 +77,25 @@ class SonarMessaging:
         if ensure_msg_type and msg_type != ensure_msg_type:
             raise SonarParserException()
 
-        data = json.loads(base64.b64decode(raw_data[6:]))
+        try:
+            data = json.loads(base64.b64decode(raw_data[6:]))
+        except:
+            raise SonarParserException()
+
         return msg_type, data
 
-    def parse_broadcast(self, raw_data: bytes) -> tuple[str, bytes]:
+    def parse_broadcast(self, raw_data: bytes) -> tuple[str, str]:
         """ Parses a broadcast message - returns hostname and payload. Raises a
         SonarParserException for any raw_data that doesnt represent a sonar broadcast.
         """
 
         _, data = self._parse_message(raw_data, SonarMsgType.BROADCAST)
-        return data["hostname"], base64.b64decode(data["payload"])
+        return data["hostname"], data["payload"]
 
-    def gen_broadcast(self, hostname: str, payload: bytes) -> bytes:
+    def gen_broadcast(self, hostname: str, payload: str) -> bytes:
         """ Generate a complete sonar broadcast packet """
 
-        data = {"hostname": hostname, "payload": base64.b64encode(payload).decode()}
+        data = {"hostname": hostname, "payload": payload}
 
         msg = b""
         msg += self.magic
@@ -68,7 +103,7 @@ class SonarMessaging:
         msg += base64.b64encode(json.dumps(data).encode())
         return msg
 
-class SonarEncryptedMessaging(SonarMessaging):
+class SonarProtoEncrypted(SonarProto):
     def __init__(self, transport_key: bytes):
         self.__key = hashlib.md5(transport_key).digest()
         super().__init__()
@@ -76,7 +111,7 @@ class SonarEncryptedMessaging(SonarMessaging):
     def parse_broadcast(self, raw_data: bytes) -> tuple[str, dict]:
         return super().parse_broadcast(self._decrypt(raw_data))
 
-    def gen_broadcast(self, hostname: str, payload: bytes) -> bytes:
+    def gen_broadcast(self, hostname: str, payload: str) -> bytes:
         return self._encrypt(super().gen_broadcast(hostname, payload))
 
     def _encrypt(self, plaintext: bytes) -> bytes:
@@ -86,61 +121,75 @@ class SonarEncryptedMessaging(SonarMessaging):
     def _decrypt(self, message: bytes) -> bytes:
         return Salsa20.new(key=self.__key, nonce=message[:8]).decrypt(message[8:])
 
-class SonarDriver(threading.Thread):
-    def __init__(self, port: int, payload: bytes, key: str = None, participate: bool = True):
-        self.port = port
-        self.broadcast_addr = "255.255.255.255"
-        self.hostname = socket.gethostname()
-        self.__shutdown_requested = threading.Event()
-
-        self.enforce_beaconing = threading.Event()
-        self.beacon_interval = datetime.timedelta(seconds=10)
-        self.ts_beacon_sent = None
-
-        self.active_beaconing = participate
+class SonarPropagation:
+    def __init__(self, hostname: str, payload: str):
+        self.hostname = hostname
         self.payload = payload
+        self.last_beaconed = None
+        self.enforce_beaconing = threading.Event()
 
-        self.msging = SonarEncryptedMessaging(key) if key else SonarMessaging()
-        self.active_peers_storage = PeersStorage(deadline=self.beacon_interval)
+    def set_new_beacontime(self) -> None:
+        self.last_beaconed = datetime.datetime.now()
 
-        super().__init__()
-
-    def shutdown(self):
-        self.__shutdown_requested.set()
-
-    def get_active_peers(self):
-        return self.active_peers_storage.get_active_peers()
-
-    def run(self) -> None:
-        self.active_peers_storage.start()
-        return self.serve_forever()
-
-    def serve_forever(self) -> None:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.bind(("", self.port))
-
-        while not self.__shutdown_requested.is_set():
-            self.do_beaconing()
-            self.handle_rx(sock)
-
-        self.active_peers_storage.shutdown()
-        self.active_peers_storage.join()
-
-    def do_beaconing(self) -> None:
-        if not self.active_beaconing:
-            return
-
-        if self.ts_beacon_sent:
-            is_due = (datetime.datetime.now() - self.ts_beacon_sent) > self.beacon_interval
+    def check_do_propagation(self, deadline: datetime.timedelta) -> bool:
+        if self.last_beaconed:
+            is_due = (datetime.datetime.now() - self.last_beaconed) > deadline
         else:
             is_due = True
 
         if self.enforce_beaconing.is_set() or is_due:
             self.enforce_beaconing.clear()
-            self.send_beacon()
+            return True
 
-    def handle_rx(self, sock) -> None:
+        return False
+
+class SonarDriver(threading.Thread):
+    def __init__(self, port: int, key: str = None):
+        self._port = port
+        self.broadcast_addr = "255.255.255.255"
+        self._shutdown_requested = threading.Event()
+
+        self.beacon_interval = datetime.timedelta(seconds=10)
+
+        self.propagate_peers = []
+
+        self.proto = SonarProtoEncrypted(key) if key else SonarProto()
+        self.active_peers_storage = PeersStorage(deadline=self.beacon_interval)
+
+        super().__init__()
+
+    def propagate_peer(self, peer: SonarPropagation):
+        self.propagate_peers.append(peer)
+
+    def shutdown(self) -> None:
+        self._shutdown_requested.set()
+
+    def get_active_peers(self) -> list[SonarPeer]:
+        return self.active_peers_storage.get_active_peers()
+
+    def run(self) -> None:
+        self.active_peers_storage.start()
+        return self._serve_forever()
+
+    def _serve_forever(self) -> None:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.bind(("", self._port))
+
+        while not self._shutdown_requested.is_set():
+            self._do_beaconing()
+            self._handle_rx(sock)
+
+        self.active_peers_storage.shutdown()
+        self.active_peers_storage.join()
+
+    def _do_beaconing(self) -> None:
+        for peer in self.propagate_peers:
+            if not peer.check_do_propagation(self.beacon_interval):
+                continue
+            self._send_beacon(peer)
+
+    def _handle_rx(self, sock) -> None:
         ready_socks = select.select([sock], [], [], 1)
         if len(ready_socks[0]) == 0:
             return
@@ -148,44 +197,25 @@ class SonarDriver(threading.Thread):
         pkt, incoming_addr = sock.recvfrom(4096)
 
         try:
-            hostname, payload = self.msging.parse_broadcast(pkt)
+            hostname, payload = self.proto.parse_broadcast(pkt)
         except SonarParserException:
             return
 
-        if hostname == self.hostname:
-            return
+        #if hostname == self.hostname:
+        #    return
 
-        ip = incoming_addr[0]
-        self.active_peers_storage.handle_beacon(ip, payload, hostname)
+        ipaddr = incoming_addr[0]
+        self.active_peers_storage.handle_beacon(ipaddr, payload, hostname)
 
-    def send_beacon(self) -> None:
-        brd_msg = self.msging.gen_broadcast(self.hostname, self.payload)
+    def _send_beacon(self, peer: SonarPropagation) -> None:
+        brd_msg = self.proto.gen_broadcast(peer.hostname, peer.payload)
 
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.sendto(brd_msg, (self.broadcast_addr, self.port))
+        sock.sendto(brd_msg, (self.broadcast_addr, self._port))
         sock.close()
 
-        self.ts_beacon_sent = datetime.datetime.now()
-
-class SonarPeer:
-    def __init__(self, ipaddr: str, payload: bytes, hostname: str, peer_id: str):
-        self.ipaddr = ipaddr
-        self.hostname = hostname
-        self.peer_id = peer_id
-        self.payload = payload
-
-        self.last_update = None
-        self.update()
-
-    def update(self, payload=None):
-        self.last_update = datetime.datetime.now()
-
-        if payload:
-            self.payload = payload
-
-    def __str__(self):
-        return f"{self.hostname}@{self.ipaddr} ({self.payload})"
+        peer.set_new_beacontime()
 
 class PeersStorage(threading.Thread):
     def __init__(self, deadline=datetime.timedelta(seconds=120)):
@@ -194,13 +224,13 @@ class PeersStorage(threading.Thread):
         self.__shutdown_requested = threading.Event()
         super().__init__()
 
-    def shutdown(self):
+    def shutdown(self) -> None:
         self.__shutdown_requested.set()
 
     def get_active_peers(self) -> list[SonarPeer]:
         return self.active_peers.values()
 
-    def cleanup(self):
+    def cleanup(self) -> None:
         list_old_peers = []
 
         for peer_id, peer in self.active_peers.items():
@@ -215,11 +245,11 @@ class PeersStorage(threading.Thread):
             self.cleanup()
             time.sleep(self.deadline.total_seconds() // 2)
 
-    def generate_peer_id(self, ipaddr: str, payload: bytes, hostname: str) -> str:
+    def generate_peer_id(self, ipaddr: str, hostname: str) -> str:
         return hashlib.sha256(f"{ipaddr}-{hostname}".encode()).hexdigest()
 
-    def handle_beacon(self, ipaddr: str, payload: bytes, hostname: str) -> None:
-        peer_id = self.generate_peer_id(ipaddr, payload, hostname)
+    def handle_beacon(self, ipaddr: str, payload: str, hostname: str) -> None:
+        peer_id = self.generate_peer_id(ipaddr, hostname)
 
         if peer_id in self.active_peers:
             self.active_peers[peer_id].update(payload)
@@ -236,10 +266,33 @@ def load_age_pubkey(privkey_path="~/.config/Sonar/private_key.age") -> typing.Op
 
     return None
 
+class HttpApi:
+    def __init__(self, driver):
+        self.driver = driver
+
+    def http_get_peers(self, request):
+        http_response = {"peers": []}
+
+        for peer in self.driver.get_active_peers():
+            http_response["peers"].append(peer.dump_dict())
+
+        return web.Response(text=json.dumps(http_response))
+
+    @staticmethod
+    def run_forever(rp):
+        api = HttpApi(rp)
+        app = web.Application()
+
+        app.add_routes([
+            web.get("/peers/", api.http_get_peers),
+        ])
+
+        web.run_app(app)
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-p", "--port", type=int, default=1337)
-    parser.add_argument("--payload", type=lambda x: x.encode())
+    parser.add_argument("--payload")
     parser.add_argument("--listen-only", action="store_true")
     parser.add_argument("-k", "--key", type=bytes.fromhex)
     args = parser.parse_args()
@@ -255,18 +308,21 @@ def main():
     print(r"                                                                            ")
     print(r"                                                                            ")
 
-    payload = args.payload or load_age_pubkey().encode() or "undefined"
-    print(f"[*] using payload {payload}")
-
     rp = SonarDriver(
         args.port,
-        payload=payload,
-        key=args.key,
-        participate=not args.listen_only
+        key=args.key
     )
+
+    if not args.listen_only:
+        payload = args.payload or load_age_pubkey() or "undefined"
+        print(f"[*] using payload {payload}")
+        rp.propagate_peer(SonarPropagation(socket.gethostname(), payload))
 
     rp.start()
 
+    if web:
+        HttpApi.run_forever(rp)
+        return
 
     try:
         while True:
